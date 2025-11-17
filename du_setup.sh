@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # Debian and Ubuntu Server Hardening Interactive Script
-# Version: 0.77 | 2025-11-17
+# Version: 0.78 | 2025-11-17
 # Changelog:
+# - v0.78: Add support for CIDR notation in IP validation helper function.
 # - v0.77: Add customizable fail2ban whitelist with suggestion for current connection and support for Tailscale.
 # - v0.76: Improve the flexibility of the built-in Docker daemon.json file to prevent any potential Docker issues.
 # - v0.75: Updated Docker daemon.json file to be more secure.
@@ -82,7 +83,7 @@
 set -euo pipefail
 
 # --- Update Configuration ---
-CURRENT_VERSION="0.77"
+CURRENT_VERSION="0.78"
 SCRIPT_URL="https://raw.githubusercontent.com/buildplan/du_setup/refs/heads/main/du_setup.sh"
 CHECKSUM_URL="${SCRIPT_URL}.sha256"
 
@@ -233,7 +234,7 @@ print_header() {
     printf '%s\n' "${CYAN}╔═════════════════════════════════════════════════════════════════╗${NC}"
     printf '%s\n' "${CYAN}║                                                                 ║${NC}"
     printf '%s\n' "${CYAN}║       DEBIAN/UBUNTU SERVER SETUP AND HARDENING SCRIPT           ║${NC}"
-    printf '%s\n' "${CYAN}║                      v0.77 | 2025-11-17                         ║${NC}"
+    printf '%s\n' "${CYAN}║                      v0.78 | 2025-11-17                         ║${NC}"
     printf '%s\n' "${CYAN}║                                                                 ║${NC}"
     printf '%s\n' "${CYAN}╚═════════════════════════════════════════════════════════════════╝${NC}"
     printf '\n'
@@ -2554,9 +2555,35 @@ validate_ufw_port() {
     [[ "$port" =~ ^[0-9]+(/tcp|/udp)?$ ]]
 }
 
-validate_ip_address() {
-    local ip="$1"
+validate_ip_or_cidr() {
+    local input="$1"
     local mode="$2"
+    local ip
+    local cidr
+    local max_cidr
+
+    if [[ "$input" == */* ]]; then
+        ip="${input%/*}"
+        cidr="${input##*/}"
+
+        # Check if CIDR is a number.
+        if ! [[ "$cidr" =~ ^[0-9]+$ ]]; then
+            return 1
+        fi
+
+        if [[ "$ip" == *:* ]]; then # IPv6
+            max_cidr=128
+        else # IPv4
+            max_cidr=32
+        fi
+
+        if [[ "$cidr" -lt 0 || "$cidr" -gt "$max_cidr" ]]; then
+            print_error "Invalid CIDR prefix range: $cidr."
+            return 1
+        fi
+    else
+        ip="$input"
+    fi
 
     if ! ip route get "$ip" &>/dev/null; then
         if [[ "$mode" != "suppress" ]]; then # Suppress error message if "suppress" is passed.
@@ -3618,7 +3645,7 @@ fail2ban_append_ignoreip() {
     local ip="$1"
     local jail_path="${2:-/etc/fail2ban/jail.local}"
 
-    if ! validate_ip_address "$ip" "suppress"; then
+    if ! validate_ip_or_cidr "$ip" "suppress"; then
         print_error "Invalid IP supplied for whitelisting: $ip"
         return 1
     fi
@@ -3683,6 +3710,7 @@ configure_fail2ban() {
     # Set whitelist contents.
     local -a WHITELIST=()
     local next_prompt="Whitelist other IP addresses?"
+    # Check if user is connected via SSH, if so, prompt for whitelisting.
     if [ -n "$SSH_CONNECTION" ] && confirm "Whitelist current connection [ ${SSH_CONNECTION%% *} ]?" "y"; then
         WHITELIST+=("${SSH_CONNECTION%% *}")
         next_prompt="Whitelist additional IP addresses?"
@@ -3690,14 +3718,14 @@ configure_fail2ban() {
     if confirm "$next_prompt"; then
         while true; do
             local -a WHITELIST_IPS=()
-            read -ra WHITELIST_IPS -p "$(printf '%s' "${CYAN}Enter IP addresses (space-separated, e.g., 1.2.3.4 2606:4700:4700::1111): ${NC}")"
+            read -ra WHITELIST_IPS -p "$(printf '%s' "${CYAN}Enter IP addresses (space-separated, e.g., 1.2.3.4 192.168.1.0/24 2606:4700:4700::1111): ${NC}")"
             if (( ${#WHITELIST_IPS[@]} == 0 )); then
                 print_info "No IP addresses entered. Skipping."
                 break
             fi
             local valid=true
             for ip in "${WHITELIST_IPS[@]}"; do
-                if ! validate_ip_address "$ip"; then
+                if ! validate_ip_or_cidr "$ip"; then
                     valid=false
                     break
                 fi
