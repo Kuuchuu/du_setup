@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # Debian and Ubuntu Server Hardening Interactive Script
-# Version: 0.78 | 2025-11-17
+# Version: 0.77.2 | 2025-11-17
 # Changelog:
-# - v0.78: Add support for CIDR notation in IP validation helper function.
+# - v0.77.2: Allow IP validation to pass when no route is available (system offline).
+# - v0.77.1: Add support for CIDR notation in IP validation helper function.
 # - v0.77: Add customizable fail2ban whitelist with suggestion for current connection and support for Tailscale.
 # - v0.76: Improve the flexibility of the built-in Docker daemon.json file to prevent any potential Docker issues.
 # - v0.75: Updated Docker daemon.json file to be more secure.
@@ -83,7 +84,7 @@
 set -euo pipefail
 
 # --- Update Configuration ---
-CURRENT_VERSION="0.78"
+CURRENT_VERSION="0.77.2"
 SCRIPT_URL="https://raw.githubusercontent.com/buildplan/du_setup/refs/heads/main/du_setup.sh"
 CHECKSUM_URL="${SCRIPT_URL}.sha256"
 
@@ -234,7 +235,7 @@ print_header() {
     printf '%s\n' "${CYAN}╔═════════════════════════════════════════════════════════════════╗${NC}"
     printf '%s\n' "${CYAN}║                                                                 ║${NC}"
     printf '%s\n' "${CYAN}║       DEBIAN/UBUNTU SERVER SETUP AND HARDENING SCRIPT           ║${NC}"
-    printf '%s\n' "${CYAN}║                      v0.78 | 2025-11-17                         ║${NC}"
+    printf '%s\n' "${CYAN}║                     v0.77.2 | 2025-11-17                        ║${NC}"
     printf '%s\n' "${CYAN}║                                                                 ║${NC}"
     printf '%s\n' "${CYAN}╚═════════════════════════════════════════════════════════════════╝${NC}"
     printf '\n'
@@ -2585,12 +2586,16 @@ validate_ip_or_cidr() {
         ip="$input"
     fi
 
-    if ! ip route get "$ip" &>/dev/null; then
-        if [[ "$mode" != "suppress" ]]; then # Suppress error message if "suppress" is passed.
-            print_error "Invalid IP address format: $ip."
-        fi
+    ip route get "$ip" &>/dev/null
+    local rc=$?
+
+    # Accept return codes 0 (valid+reachable) and 2 (valid but unreachable).
+    if [[ $rc -ne 0 && $rc -ne 2 ]]; then
+        # IP is syntactically invalid.
+        [[ "$mode" != "suppress" ]] && print_error "Invalid IP address format: $ip."
         return 1
     fi
+
     return 0
 }
 
