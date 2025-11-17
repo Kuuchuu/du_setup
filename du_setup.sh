@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # Debian and Ubuntu Server Hardening Interactive Script
-# Version: 0.76 | 2025-11-10
+# Version: 0.77 | 2025-11-17
 # Changelog:
+# - v0.77: Add customizable fail2ban whitelist with suggestion for current connection and support for Tailscale.
 # - v0.76: Improve the flexibility of the built-in Docker daemon.json file to prevent any potential Docker issues.
 # - v0.75: Updated Docker daemon.json file to be more secure.
 # - v0.74: Add optional dtop (https://github.com/amir20/dtop) after docker installation.
@@ -81,7 +82,7 @@
 set -euo pipefail
 
 # --- Update Configuration ---
-CURRENT_VERSION="0.76"
+CURRENT_VERSION="0.77"
 SCRIPT_URL="https://raw.githubusercontent.com/buildplan/du_setup/refs/heads/main/du_setup.sh"
 CHECKSUM_URL="${SCRIPT_URL}.sha256"
 
@@ -2553,6 +2554,19 @@ validate_ufw_port() {
     [[ "$port" =~ ^[0-9]+(/tcp|/udp)?$ ]]
 }
 
+validate_ip_address() {
+    local ip="$1"
+    local mode="$2"
+
+    if ! ip route get "$ip" &>/dev/null; then
+        if [[ "$mode" != "suppress" ]]; then # Suppress error message if "suppress" is passed.
+            print_error "Invalid IP address format: $ip."
+        fi
+        return 1
+    fi
+    return 0
+}
+
 convert_to_bytes() {
     local size_upper="${1^^}" # Convert to uppercase for case-insensitivity
     local unit="${size_upper: -1}"
@@ -3600,10 +3614,119 @@ configure_firewall() {
     log "Firewall configuration completed."
 }
 
+fail2ban_append_ignoreip() {
+    local ip="$1"
+    local jail_path="${2:-/etc/fail2ban/jail.local}"
+
+    if ! validate_ip_address "$ip" "suppress"; then
+        print_error "Invalid IP supplied for whitelisting: $ip"
+        return 1
+    fi
+    if [[ ! -f "$jail_path" ]]; then
+        print_error "Fail2Ban jail file not found: $jail_path"
+        return 1
+    fi
+
+    if grep -Eq '^[[:space:]]*ignoreip[[:space:]]*=.*[[:space:]]'"$ip"'([[:space:]]|$)' "$jail_path"; then
+        print_info "IP $ip is already whitelisted in Fail2Ban."
+        return 0
+    fi
+
+    local tmp
+    tmp="$(mktemp)"
+
+    # If there is no [DEFAULT] section, create it at the top.
+    if ! grep -q '^[[:space:]]*\[DEFAULT\]' "$jail_path"; then
+        {
+            printf '[DEFAULT]\n'
+            printf 'ignoreip = %s\n\n' "$ip"
+            cat "$jail_path"
+        } >"$tmp"
+        mv "$tmp" "$jail_path"
+        print_info "Created [DEFAULT] section and whitelisted $ip in Fail2Ban."
+        return 0
+    fi
+
+    # [DEFAULT] exists: Check for ignoreip.
+    if awk '
+        /^[[:space:]]*\[DEFAULT\]/ { in_default=1; next }
+        /^\[/ && $0 !~ /^[[:space:]]*\[DEFAULT\]/ { in_default=0 }
+        in_default && /^[[:space:]]*ignoreip[[:space:]]*=/ { found=1 }
+        END { exit(found ? 0 : 1) }
+    ' "$jail_path"; then
+        # Append to ignoreip inside [DEFAULT].
+        awk -v ip="$ip" '
+            BEGIN { in_default=0 }
+            /^[[:space:]]*\[DEFAULT\]/ { in_default=1; print; next }
+            /^\[/ && $0 !~ /^[[:space:]]*\[DEFAULT\]/ { in_default=0 }
+            {
+                if (in_default && /^[[:space:]]*ignoreip[[:space:]]*=/) {
+                    sub(/[[:space:]]*$/, "")      # trim trailing spaces
+                    print $0 " " ip
+                } else {
+                    print
+                }
+            }
+        ' "$jail_path" >"$tmp" && mv "$tmp" "$jail_path"
+        print_info "Whitelisted $ip in Fail2Ban [DEFAULT] ignoreip."
+    else
+        # [DEFAULT] exists: No ignoreip found; Create ignoreip directive.
+        sed -i "/^[[:space:]]*\[DEFAULT\]/a ignoreip = $ip" "$jail_path"
+        print_info "Added ignoreip directive and whitelisted $ip in Fail2Ban [DEFAULT]."
+    fi
+}
+
 configure_fail2ban() {
     print_section "Fail2Ban Configuration"
 
     # --- Define Desired Configurations ---
+    # Set whitelist contents.
+    local -a WHITELIST=()
+    local next_prompt="Whitelist other IP addresses?"
+    if [ -n "$SSH_CONNECTION" ] && confirm "Whitelist current connection [ ${SSH_CONNECTION%% *} ]?" "y"; then
+        WHITELIST+=("${SSH_CONNECTION%% *}")
+        next_prompt="Whitelist additional IP addresses?"
+    fi
+    if confirm "$next_prompt"; then
+        while true; do
+            local -a WHITELIST_IPS=()
+            read -ra WHITELIST_IPS -p "$(printf '%s' "${CYAN}Enter IP addresses (space-separated, e.g., 1.2.3.4 2606:4700:4700::1111): ${NC}")"
+            if (( ${#WHITELIST_IPS[@]} == 0 )); then
+                print_info "No IP addresses entered. Skipping."
+                break
+            fi
+            local valid=true
+            for ip in "${WHITELIST_IPS[@]}"; do
+                if ! validate_ip_address "$ip"; then
+                    valid=false
+                    break
+                fi
+            done
+            if [[ "$valid" == true ]]; then
+                WHITELIST+=( "${WHITELIST_IPS[@]}" )
+                break
+            else
+                print_info "Please try again."
+            fi
+        done
+    fi
+    # Deduplicate final WHITELIST
+    if (( ${#WHITELIST[@]} > 0 )); then
+        local -A seen=()
+        local -a unique=()
+        for ip in "${WHITELIST[@]}"; do
+            [[ -z ${seen[$ip]} ]] && {
+                seen[$ip]=1
+                unique+=( "$ip" )
+            }
+        done
+        WHITELIST=( "${unique[@]}" )
+    fi
+    printf -v WHITELIST_STR "Whitelisting:\n"
+    for ip in "${WHITELIST[@]}"; do
+        printf -v WHITELIST_STR "%s  %s\n" "$WHITELIST_STR" "$ip"
+    done
+    print_info "$WHITELIST_STR"
     # Define content of config file.
     local UFW_PROBES_CONFIG
     UFW_PROBES_CONFIG=$(cat <<'EOF'
@@ -3617,7 +3740,7 @@ EOF
     local JAIL_LOCAL_CONFIG
     JAIL_LOCAL_CONFIG=$(cat <<EOF
 [DEFAULT]
-ignoreip = 127.0.0.1/8 ::1
+ignoreip = 127.0.0.1/8 ::1 ${WHITELIST[*]}
 bantime = 1d
 findtime = 10m
 maxretry = 5
@@ -3947,6 +4070,7 @@ install_tailscale() {
             TS_IPS=$(tailscale ip 2>/dev/null || echo "Unknown")
             TS_IPV4=$(echo "$TS_IPS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || echo "Unknown")
             print_success "Service tailscaled is active and connected. Node IPv4 in tailnet: $TS_IPV4"
+            fail2ban_append_ignoreip "$TS_IPV4" "/etc/fail2ban/jail.local"
             echo "$TS_IPS" > /tmp/tailscale_ips.txt
         else
             print_warning "Service tailscaled is installed but not active or connected."
